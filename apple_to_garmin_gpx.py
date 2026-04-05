@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import os
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import re
+from zipfile import ZIP_DEFLATED, ZipFile
 import xml.etree.ElementTree as ET
 
 
@@ -28,6 +29,9 @@ class Config:
     output_prefix: str
     mode: str
     limit: int | None
+    heart_rate_source: str
+    fuzzy_match_seconds: int
+    debug_xlsx: bool
     overwrite_existing: bool
 
 
@@ -42,6 +46,20 @@ class WorkoutInfo:
     source_name: str | None
 
 
+@dataclass
+class SampleInterval:
+    start: datetime
+    end: datetime
+    value: int
+
+
+@dataclass
+class WorkoutMetrics:
+    heart_rate: list[SampleInterval]
+    cadence: list[SampleInterval]
+    source_records: list[dict[str, str]]
+
+
 def main() -> None:
     project_root = Path(__file__).resolve().parent
     config = load_config(project_root)
@@ -49,7 +67,7 @@ def main() -> None:
     summary = convert_routes(config, route_map)
 
     print(f"Running workouts found in export.xml: {len(route_map)}")
-    print(f"Converted GPX files written: {summary['written']}")
+    print(f"Converted {config.mode.upper()} files written: {summary['written']}")
     print(f"Skipped existing files: {summary['skipped_existing']}")
     print(f"Missing route files: {summary['missing_routes']}")
     print(f"Output folder: {config.output_dir}")
@@ -80,6 +98,11 @@ def load_config(project_root: Path) -> Config:
         output_prefix=env_values.get("OUTPUT_PREFIX", "activity"),
         mode=parse_mode(env_values.get("MODE", "gpx")),
         limit=parse_optional_int(env_values.get("LIMIT")),
+        heart_rate_source=parse_heart_rate_source(
+            env_values.get("HEART_RATE_SOURCE", "record")
+        ),
+        fuzzy_match_seconds=parse_non_negative_int(env_values.get("FUZZY_MATCH_SECONDS", "0")),
+        debug_xlsx=parse_bool(env_values.get("DEBUG_XLSX", "false")),
         overwrite_existing=parse_bool(env_values.get("OVERWRITE_EXISTING", "true")),
     )
 
@@ -129,6 +152,20 @@ def parse_optional_int(value: str | None) -> int | None:
     if limit <= 0:
         raise ValueError("LIMIT must be a positive integer when provided")
     return limit
+
+
+def parse_non_negative_int(value: str) -> int:
+    parsed = int(value.strip())
+    if parsed < 0:
+        raise ValueError("FUZZY_MATCH_SECONDS must be zero or greater")
+    return parsed
+
+
+def parse_heart_rate_source(value: str) -> str:
+    source = value.strip().lower()
+    if source not in {"record", "motion_context"}:
+        raise ValueError("HEART_RATE_SOURCE must be 'record' or 'motion_context'")
+    return source
 
 
 def resolve_path(project_root: Path, raw_path: str) -> Path:
@@ -207,6 +244,13 @@ def convert_routes(config: Config, route_map: dict[str, WorkoutInfo]) -> dict[st
     if config.limit is not None:
         items = items[: config.limit]
 
+    metrics_by_route = load_workout_metrics(
+        config.export_xml_path,
+        items,
+        config.heart_rate_source,
+    )
+    export_catalogs = load_export_catalogs(config.export_xml_path) if config.debug_xlsx else None
+
     for route_key, workout in items:
         route_file = config.apple_export_dir / route_key
         if not route_file.exists():
@@ -230,16 +274,29 @@ def convert_routes(config: Config, route_map: dict[str, WorkoutInfo]) -> dict[st
             output_tree = build_garmin_gpx_tree(
                 apple_route_path=route_file,
                 workout=workout,
+                metrics=metrics_by_route.get(route_key, WorkoutMetrics([], [], [])),
+                fuzzy_match_seconds=config.fuzzy_match_seconds,
                 garmin_creator=config.garmin_creator,
             )
         else:
             output_tree = build_garmin_tcx_tree(
                 apple_route_path=route_file,
                 workout=workout,
+                metrics=metrics_by_route.get(route_key, WorkoutMetrics([], [], [])),
+                fuzzy_match_seconds=config.fuzzy_match_seconds,
             )
 
         indent_xml(output_tree)
         output_tree.write(output_path, encoding="utf-8", xml_declaration=True)
+        if config.debug_xlsx:
+            write_debug_workbook(
+                output_path=output_path,
+                export_catalogs=export_catalogs,
+                apple_route_path=route_file,
+                workout=workout,
+                metrics=metrics_by_route.get(route_key, WorkoutMetrics([], [], [])),
+                fuzzy_match_seconds=config.fuzzy_match_seconds,
+            )
         summary["written"] += 1
 
     return summary
@@ -253,6 +310,8 @@ def build_output_filename(output_prefix: str, workout: WorkoutInfo, mode: str) -
 def build_garmin_gpx_tree(
     apple_route_path: Path,
     workout: WorkoutInfo,
+    metrics: WorkoutMetrics,
+    fuzzy_match_seconds: int,
     garmin_creator: str,
 ) -> ET.ElementTree:
     apple_tree = ET.parse(apple_route_path)
@@ -285,6 +344,8 @@ def build_garmin_gpx_tree(
     if not apple_trkpts:
         raise ValueError(f"No track points found in {apple_route_path}")
 
+    hr_cursor = 0
+    cad_cursor = 0
     for apple_trkpt in apple_trkpts:
         garmin_trkpt = ET.SubElement(
             trkseg,
@@ -301,12 +362,37 @@ def build_garmin_gpx_tree(
         if apple_ele is not None and apple_ele.text:
             ET.SubElement(garmin_trkpt, f"{{{APPLE_GPX_NS}}}ele").text = apple_ele.text
         if apple_time is not None and apple_time.text:
+            point_time = datetime.fromisoformat(apple_time.text.replace("Z", "+00:00"))
             ET.SubElement(garmin_trkpt, f"{{{APPLE_GPX_NS}}}time").text = normalize_utc_text(apple_time.text)
+            heart_rate, hr_cursor = sample_value_for_time(
+                metrics.heart_rate,
+                point_time,
+                hr_cursor,
+                fuzzy_match_seconds,
+            )
+            cadence, cad_cursor = sample_value_for_time(
+                metrics.cadence,
+                point_time,
+                cad_cursor,
+                fuzzy_match_seconds,
+            )
+            if heart_rate is not None or cadence is not None:
+                extensions = ET.SubElement(garmin_trkpt, f"{{{APPLE_GPX_NS}}}extensions")
+                tpx = ET.SubElement(extensions, f"{{{GARMIN_TPX_NS}}}TrackPointExtension")
+                if heart_rate is not None:
+                    ET.SubElement(tpx, f"{{{GARMIN_TPX_NS}}}hr").text = str(heart_rate)
+                if cadence is not None:
+                    ET.SubElement(tpx, f"{{{GARMIN_TPX_NS}}}cad").text = str(cadence)
 
     return ET.ElementTree(garmin_root)
 
 
-def build_garmin_tcx_tree(apple_route_path: Path, workout: WorkoutInfo) -> ET.ElementTree:
+def build_garmin_tcx_tree(
+    apple_route_path: Path,
+    workout: WorkoutInfo,
+    metrics: WorkoutMetrics,
+    fuzzy_match_seconds: int,
+) -> ET.ElementTree:
     apple_tree = ET.parse(apple_route_path)
     apple_root = apple_tree.getroot()
     apple_trkpts = apple_root.findall(f".//{{{APPLE_GPX_NS}}}trkpt")
@@ -341,13 +427,33 @@ def build_garmin_tcx_tree(apple_route_path: Path, workout: WorkoutInfo) -> ET.El
     ET.SubElement(lap, f"{{{tcx_ns}}}TriggerMethod").text = "Manual"
 
     track = ET.SubElement(lap, f"{{{tcx_ns}}}Track")
+    hr_cursor = 0
+    cad_cursor = 0
     for apple_trkpt in apple_trkpts:
         trackpoint = ET.SubElement(track, f"{{{tcx_ns}}}Trackpoint")
         apple_time = apple_trkpt.find(f"{{{APPLE_GPX_NS}}}time")
         apple_ele = apple_trkpt.find(f"{{{APPLE_GPX_NS}}}ele")
 
         if apple_time is not None and apple_time.text:
+            point_time = datetime.fromisoformat(apple_time.text.replace("Z", "+00:00"))
             ET.SubElement(trackpoint, f"{{{tcx_ns}}}Time").text = normalize_utc_text(apple_time.text)
+            heart_rate, hr_cursor = sample_value_for_time(
+                metrics.heart_rate,
+                point_time,
+                hr_cursor,
+                fuzzy_match_seconds,
+            )
+            cadence, cad_cursor = sample_value_for_time(
+                metrics.cadence,
+                point_time,
+                cad_cursor,
+                fuzzy_match_seconds,
+            )
+            if heart_rate is not None:
+                heart_rate_bpm = ET.SubElement(trackpoint, f"{{{tcx_ns}}}HeartRateBpm")
+                ET.SubElement(heart_rate_bpm, f"{{{tcx_ns}}}Value").text = str(heart_rate)
+            if cadence is not None:
+                ET.SubElement(trackpoint, f"{{{tcx_ns}}}Cadence").text = str(cadence)
 
         position = ET.SubElement(trackpoint, f"{{{tcx_ns}}}Position")
         ET.SubElement(position, f"{{{tcx_ns}}}LatitudeDegrees").text = apple_trkpt.attrib["lat"]
@@ -357,6 +463,172 @@ def build_garmin_tcx_tree(apple_route_path: Path, workout: WorkoutInfo) -> ET.El
             ET.SubElement(trackpoint, f"{{{tcx_ns}}}AltitudeMeters").text = apple_ele.text
 
     return ET.ElementTree(root)
+
+
+def load_workout_metrics(
+    export_xml_path: Path,
+    workout_items: list[tuple[str, WorkoutInfo]],
+    heart_rate_source: str,
+) -> dict[str, WorkoutMetrics]:
+    metrics_by_route = {
+        route_key: WorkoutMetrics(heart_rate=[], cadence=[], source_records=[])
+        for route_key, _ in workout_items
+    }
+    if not workout_items:
+        return metrics_by_route
+
+    sorted_items = sorted(workout_items, key=lambda item: item[1].start_date)
+    starts = [workout.start_date for _, workout in sorted_items]
+
+    for _, elem in ET.iterparse(export_xml_path, events=("end",)):
+        if elem.tag != "Record":
+            continue
+
+        record_type = elem.attrib.get("type")
+        if record_type not in {
+            "HKQuantityTypeIdentifierHeartRate",
+            "HKQuantityTypeIdentifierStepCount",
+        }:
+            elem.clear()
+            continue
+
+        try:
+            sample_start = parse_apple_datetime(elem.attrib["startDate"])
+            sample_end = parse_apple_datetime(elem.attrib["endDate"])
+        except (KeyError, ValueError):
+            elem.clear()
+            continue
+
+        value_text = elem.attrib.get("value")
+        if not value_text:
+            elem.clear()
+            continue
+
+        source_name = elem.attrib.get("sourceName", "").replace("\xa0", " ")
+        watch_source = "Apple Watch" in source_name
+        if not watch_source:
+            elem.clear()
+            continue
+
+        if record_type == "HKQuantityTypeIdentifierHeartRate" and heart_rate_source == "motion_context":
+            raise ValueError(
+                "HEART_RATE_SOURCE=motion_context is not supported for Garmin export because "
+                "HKMetadataKeyHeartRateMotionContext contains categorical values like 0/1/2, not BPM."
+            )
+
+        sample_value = convert_record_to_metric_value(
+            record_type=record_type,
+            value_text=value_text,
+            sample_start=sample_start,
+            sample_end=sample_end,
+        )
+        if sample_value is None:
+            elem.clear()
+            continue
+
+        candidate_index = bisect_right(starts, sample_end)
+        for index in range(candidate_index - 1, -1, -1):
+            route_key, workout = sorted_items[index]
+            if workout.end_date < sample_start:
+                break
+            if workout.start_date <= sample_end and workout.end_date >= sample_start:
+                interval = SampleInterval(sample_start, sample_end, sample_value)
+                if record_type == "HKQuantityTypeIdentifierHeartRate":
+                    metrics_by_route[route_key].heart_rate.append(interval)
+                else:
+                    metrics_by_route[route_key].cadence.append(interval)
+                metrics_by_route[route_key].source_records.append(
+                    {
+                        "record_type": record_type,
+                        "start": sample_start.isoformat(),
+                        "end": sample_end.isoformat(),
+                        "value": value_text,
+                        "unit": elem.attrib.get("unit", ""),
+                        "source_name": source_name,
+                    }
+                )
+        elem.clear()
+
+    for metrics in metrics_by_route.values():
+        metrics.heart_rate.sort(key=lambda interval: interval.start)
+        metrics.cadence.sort(key=lambda interval: interval.start)
+
+    return metrics_by_route
+
+
+def convert_record_to_metric_value(
+    record_type: str,
+    value_text: str,
+    sample_start: datetime,
+    sample_end: datetime,
+) -> int | None:
+    try:
+        value = float(value_text)
+    except ValueError:
+        return None
+
+    if record_type == "HKQuantityTypeIdentifierHeartRate":
+        return round(value)
+
+    duration_seconds = max((sample_end - sample_start).total_seconds(), 0)
+    if duration_seconds <= 0:
+        return None
+
+    steps_per_minute = (value * 60) / duration_seconds
+    return round(steps_per_minute)
+
+
+def sample_value_for_time(
+    intervals: list[SampleInterval],
+    point_time: datetime,
+    cursor: int,
+    fuzzy_match_seconds: int,
+) -> tuple[int | None, int]:
+    while cursor < len(intervals) and intervals[cursor].end < point_time:
+        cursor += 1
+
+    if cursor < len(intervals):
+        interval = intervals[cursor]
+        if interval.start <= point_time <= interval.end:
+            return interval.value, cursor
+
+    if fuzzy_match_seconds <= 0:
+        return None, cursor
+
+    candidates: list[tuple[float, int, int]] = []
+    if cursor < len(intervals):
+        next_interval = intervals[cursor]
+        candidates.append(
+            (
+                boundary_distance_seconds(next_interval, point_time),
+                next_interval.value,
+                cursor,
+            )
+        )
+    if cursor > 0:
+        previous_interval = intervals[cursor - 1]
+        candidates.append(
+            (
+                boundary_distance_seconds(previous_interval, point_time),
+                previous_interval.value,
+                cursor - 1,
+            )
+        )
+
+    if candidates:
+        delta, value, matched_cursor = min(candidates, key=lambda item: item[0])
+        if delta <= fuzzy_match_seconds:
+            return value, matched_cursor
+
+    return None, cursor
+
+
+def boundary_distance_seconds(interval: SampleInterval, point_time: datetime) -> float:
+    if interval.start <= point_time <= interval.end:
+        return 0.0
+    if point_time < interval.start:
+        return (interval.start - point_time).total_seconds()
+    return (point_time - interval.end).total_seconds()
 
 
 def build_track_name(workout: WorkoutInfo) -> str:
@@ -419,6 +691,278 @@ def format_distance_meters(workout: WorkoutInfo) -> str:
     else:
         meters = distance
     return f"{meters:.3f}"
+
+
+def write_debug_workbook(
+    output_path: Path,
+    export_catalogs: tuple[list[list[str]], list[list[str]]] | None,
+    apple_route_path: Path,
+    workout: WorkoutInfo,
+    metrics: WorkoutMetrics,
+    fuzzy_match_seconds: int,
+) -> None:
+    workbook_path = output_path.with_suffix(".debug.xlsx")
+    sheets = {
+        "route_points": build_debug_points_rows(
+            apple_route_path=apple_route_path,
+            metrics=metrics,
+            fuzzy_match_seconds=fuzzy_match_seconds,
+        ),
+        "source_records": build_debug_records_rows(workout, metrics),
+    }
+    if export_catalogs is not None:
+        metadata_rows, record_rows = export_catalogs
+        sheets["metadata_keys"] = metadata_rows
+        sheets["record_types"] = record_rows
+
+    create_xlsx(
+        workbook_path,
+        sheets,
+    )
+
+
+def build_debug_points_rows(
+    apple_route_path: Path,
+    metrics: WorkoutMetrics,
+    fuzzy_match_seconds: int,
+) -> list[list[str]]:
+    apple_tree = ET.parse(apple_route_path)
+    apple_root = apple_tree.getroot()
+    apple_trkpts = apple_root.findall(f".//{{{APPLE_GPX_NS}}}trkpt")
+
+    rows = [[
+        "point_time",
+        "lat",
+        "lon",
+        "ele",
+        "matched_hr",
+        "matched_cadence",
+    ]]
+    hr_cursor = 0
+    cad_cursor = 0
+
+    for apple_trkpt in apple_trkpts:
+        apple_time = apple_trkpt.find(f"{{{APPLE_GPX_NS}}}time")
+        apple_ele = apple_trkpt.find(f"{{{APPLE_GPX_NS}}}ele")
+        point_time = None
+        heart_rate = None
+        cadence = None
+
+        if apple_time is not None and apple_time.text:
+            point_time = datetime.fromisoformat(apple_time.text.replace("Z", "+00:00"))
+            heart_rate, hr_cursor = sample_value_for_time(
+                metrics.heart_rate,
+                point_time,
+                hr_cursor,
+                fuzzy_match_seconds,
+            )
+            cadence, cad_cursor = sample_value_for_time(
+                metrics.cadence,
+                point_time,
+                cad_cursor,
+                fuzzy_match_seconds,
+            )
+
+        rows.append([
+            apple_time.text if apple_time is not None and apple_time.text else "",
+            apple_trkpt.attrib.get("lat", ""),
+            apple_trkpt.attrib.get("lon", ""),
+            apple_ele.text if apple_ele is not None and apple_ele.text else "",
+            "" if heart_rate is None else str(heart_rate),
+            "" if cadence is None else str(cadence),
+        ])
+
+    return rows
+
+
+def build_debug_records_rows(
+    workout: WorkoutInfo,
+    metrics: WorkoutMetrics,
+) -> list[list[str]]:
+    rows = [[
+        "run_start",
+        "run_end",
+        "record_type",
+        "record_start",
+        "record_end",
+        "value",
+        "unit",
+        "source_name",
+    ]]
+    for record in sorted(metrics.source_records, key=lambda item: (item["record_type"], item["start"])):
+        rows.append([
+            workout.start_date.isoformat(),
+            workout.end_date.isoformat(),
+            record["record_type"],
+            record["start"],
+            record["end"],
+            record["value"],
+            record["unit"],
+            record["source_name"],
+        ])
+    return rows
+
+
+def load_export_catalogs(export_xml_path: Path) -> tuple[list[list[str]], list[list[str]]]:
+    metadata_counts: dict[str, int] = {}
+    metadata_examples: dict[str, str] = {}
+    record_counts: dict[str, int] = {}
+    record_units: dict[str, str] = {}
+    record_sources: dict[str, str] = {}
+
+    for _, elem in ET.iterparse(export_xml_path, events=("end",)):
+        if elem.tag == "MetadataEntry":
+            key = elem.attrib.get("key")
+            if key:
+                metadata_counts[key] = metadata_counts.get(key, 0) + 1
+                metadata_examples.setdefault(key, elem.attrib.get("value", ""))
+        elif elem.tag == "Record":
+            record_type = elem.attrib.get("type")
+            if record_type:
+                record_counts[record_type] = record_counts.get(record_type, 0) + 1
+                record_units.setdefault(record_type, elem.attrib.get("unit", ""))
+                record_sources.setdefault(
+                    record_type,
+                    elem.attrib.get("sourceName", "").replace("\xa0", " "),
+                )
+        elem.clear()
+
+    metadata_rows = [[
+        "metadata_key",
+        "count",
+        "example_value",
+    ]]
+    for key in sorted(metadata_counts):
+        metadata_rows.append([
+            key,
+            str(metadata_counts[key]),
+            metadata_examples.get(key, ""),
+        ])
+
+    record_rows = [[
+        "record_type",
+        "count",
+        "unit",
+        "example_source",
+    ]]
+    for record_type in sorted(record_counts):
+        record_rows.append([
+            record_type,
+            str(record_counts[record_type]),
+            record_units.get(record_type, ""),
+            record_sources.get(record_type, ""),
+        ])
+
+    return metadata_rows, record_rows
+
+
+def create_xlsx(path: Path, sheets: dict[str, list[list[str]]]) -> None:
+    sheet_names = list(sheets.keys())
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", build_content_types_xml(len(sheet_names)))
+        zf.writestr("_rels/.rels", ROOT_RELS_XML)
+        zf.writestr("xl/workbook.xml", build_workbook_xml(sheet_names))
+        zf.writestr("xl/_rels/workbook.xml.rels", build_workbook_rels_xml(len(sheet_names)))
+        for index, sheet_name in enumerate(sheet_names, start=1):
+            zf.writestr(
+                f"xl/worksheets/sheet{index}.xml",
+                build_sheet_xml(sheets[sheet_name]),
+            )
+
+
+def build_content_types_xml(sheet_count: int) -> str:
+    overrides = [
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+    ]
+    for index in range(1, sheet_count + 1):
+        overrides.append(
+            f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        + "".join(overrides)
+        + "</Types>"
+    )
+
+
+ROOT_RELS_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" '
+    'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+    'Target="xl/workbook.xml"/>'
+    '</Relationships>'
+)
+
+
+def build_workbook_xml(sheet_names: list[str]) -> str:
+    sheets_xml = []
+    for index, name in enumerate(sheet_names, start=1):
+        sheets_xml.append(
+            f'<sheet name="{xml_escape(name[:31])}" sheetId="{index}" r:id="rId{index}"/>'
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f"<sheets>{''.join(sheets_xml)}</sheets>"
+        "</workbook>"
+    )
+
+
+def build_workbook_rels_xml(sheet_count: int) -> str:
+    rels_xml = []
+    for index in range(1, sheet_count + 1):
+        rels_xml.append(
+            f'<Relationship Id="rId{index}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            f'Target="worksheets/sheet{index}.xml"/>'
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(rels_xml)
+        + "</Relationships>"
+    )
+
+
+def build_sheet_xml(rows: list[list[str]]) -> str:
+    row_xml = []
+    for row_index, row in enumerate(rows, start=1):
+        cells = []
+        for col_index, value in enumerate(row, start=1):
+            cell_ref = f"{excel_column_name(col_index)}{row_index}"
+            cells.append(
+                f'<c r="{cell_ref}" t="inlineStr"><is><t>{xml_escape(value)}</t></is></c>'
+            )
+        row_xml.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f"<sheetData>{''.join(row_xml)}</sheetData>"
+        "</worksheet>"
+    )
+
+
+def excel_column_name(index: int) -> str:
+    name = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def xml_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def indent_xml(tree: ET.ElementTree) -> None:

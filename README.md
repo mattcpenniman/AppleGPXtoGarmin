@@ -25,6 +25,9 @@ Edit `.env` if you want different input or output paths:
 - `OUTPUT_PREFIX`
 - `MODE` (`gpx` or `tcx`)
 - `LIMIT` (optional, for example `1`)
+- `HEART_RATE_SOURCE` (`record`; `motion_context` is intentionally rejected because it is not BPM)
+- `FUZZY_MATCH_SECONDS` (optional small gap fill, for example `10`)
+- `DEBUG_XLSX` (`true` to save an Excel debug workbook beside each output)
 - `OVERWRITE_EXISTING`
 
 ## Run In An IDE

@@ -4,3 +4,4 @@ Garmin Example/
 garmin_gpx_output/
 .env
 .DS_Store
+*.pyc
