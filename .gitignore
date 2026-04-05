@@ -1,0 +1,6 @@
+apple_health_export/
+Archive/
+Garmin Example/
+garmin_gpx_output/
+.env
+.DS_Store
