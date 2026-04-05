@@ -165,15 +165,26 @@ HTML_PAGE = """<!doctype html>
   <div class="wrap">
     <section class="hero">
       <h1>Apple Health Export Explorer</h1>
-      <div class="sub">Browse raw Apple Health records directly from <code>export.xml</code>. Filter by record type, date range, source name, and result limit to understand what the export actually contains.</div>
+      <div class="sub">Browse raw Apple Health records and workouts directly from <code>export.xml</code>. Filter by type, date range, source name, and result limit to understand what the export actually contains.</div>
     </section>
 
     <div class="grid">
       <aside class="card">
         <h2>Filters</h2>
         <div class="field">
+          <label for="mode">Explorer mode</label>
+          <select id="mode">
+            <option value="records">Records</option>
+            <option value="workouts">Workouts</option>
+          </select>
+        </div>
+        <div class="field" id="recordTypeField">
           <label for="recordType">Record type</label>
           <select id="recordType"></select>
+        </div>
+        <div class="field" id="workoutTypeField" style="display:none">
+          <label for="workoutType">Workout activity type</label>
+          <select id="workoutType"></select>
         </div>
         <div class="field">
           <label for="startDate">Start date</label>
@@ -191,10 +202,10 @@ HTML_PAGE = """<!doctype html>
           <label for="limit">Limit</label>
           <input id="limit" type="number" min="1" max="500" value="100">
         </div>
-        <button id="loadButton">Load records</button>
+        <button id="loadButton">Load results</button>
         <button id="refreshCacheButton" style="margin-top:10px;background:#c96d2d">Update cache</button>
         <div class="small muted" style="margin-top:12px">
-          Date filters are interpreted in local browser time and matched against Apple Health record start/end dates.
+          Date filters are interpreted in local browser time and matched against Apple Health start/end dates.
         </div>
       </aside>
 
@@ -206,8 +217,8 @@ HTML_PAGE = """<!doctype html>
           </div>
           <div class="meta" id="summary"></div>
         </div>
-        <div class="table-wrap">
-          <table>
+        <div class="table-wrap" id="recordsTableWrap">
+          <table id="recordsTable">
             <thead>
               <tr>
                 <th>Type</th>
@@ -222,12 +233,28 @@ HTML_PAGE = """<!doctype html>
             <tbody id="rows"></tbody>
           </table>
         </div>
+        <div class="table-wrap" id="workoutsTableWrap" style="display:none">
+          <table id="workoutsTable">
+            <thead>
+              <tr>
+                <th>Activity Type</th>
+                <th>Duration</th>
+                <th>Start</th>
+                <th>End</th>
+                <th>Source</th>
+                <th>Device</th>
+                <th>Metadata</th>
+              </tr>
+            </thead>
+            <tbody id="workoutRows"></tbody>
+          </table>
+        </div>
       </main>
     </div>
   </div>
 
   <script>
-    const state = { recordTypes: [] };
+    const state = { recordTypes: [], workoutTypes: [] };
 
     async function fetchJson(url, options = {}) {
       const response = await fetch(url, options);
@@ -272,9 +299,40 @@ HTML_PAGE = """<!doctype html>
       }
     }
 
+    function renderWorkoutRows(workouts) {
+      const tbody = document.getElementById("workoutRows");
+      tbody.innerHTML = "";
+      for (const workout of workouts) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${workout.workoutActivityType || ""}</td>
+          <td>${workout.duration || ""} ${workout.durationUnit || ""}</td>
+          <td>${workout.startDate || ""}</td>
+          <td>${workout.endDate || ""}</td>
+          <td>${workout.sourceName || ""}</td>
+          <td>${workout.device || ""}</td>
+          <td class="small">${fmtMeta(workout.metadata)}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+
+    function syncModeUi() {
+      const mode = document.getElementById("mode").value;
+      const recordsMode = mode === "records";
+      document.getElementById("recordTypeField").style.display = recordsMode ? "block" : "none";
+      document.getElementById("workoutTypeField").style.display = recordsMode ? "none" : "block";
+      document.getElementById("recordsTableWrap").style.display = recordsMode ? "block" : "none";
+      document.getElementById("workoutsTableWrap").style.display = recordsMode ? "none" : "block";
+      document.getElementById("status").textContent = recordsMode
+        ? "Pick a record type and load some rows."
+        : "Pick a workout activity type and load some workouts.";
+    }
+
     async function loadRecordTypes() {
       const data = await fetchJson("/api/record-types");
       state.recordTypes = data.record_types;
+      state.workoutTypes = data.workout_types;
       const select = document.getElementById("recordType");
       select.innerHTML = `<option value="">Choose a record type…</option>`;
       for (const item of state.recordTypes) {
@@ -283,9 +341,18 @@ HTML_PAGE = """<!doctype html>
         option.textContent = `${item.type} (${item.count})`;
         select.appendChild(option);
       }
-      document.getElementById("status").textContent = "Pick a record type and load some rows.";
+      const workoutSelect = document.getElementById("workoutType");
+      workoutSelect.innerHTML = `<option value="">Choose a workout type…</option>`;
+      for (const item of state.workoutTypes) {
+        const option = document.createElement("option");
+        option.value = item.type;
+        option.textContent = `${item.type} (${item.count})`;
+        workoutSelect.appendChild(option);
+      }
+      syncModeUi();
       buildSummary([
         `${data.record_types.length} record types`,
+        `${data.workout_types.length} workout types`,
         `${data.metadata_key_count} metadata keys`,
         data.cache_updated_at ? `cached ${data.cache_updated_at}` : "fresh scan"
       ]);
@@ -297,6 +364,7 @@ HTML_PAGE = """<!doctype html>
       document.getElementById("status").textContent = "Cache refreshed.";
       buildSummary([
         `${data.record_types.length} record types`,
+        `${data.workout_types.length} workout types`,
         `${data.metadata_key_count} metadata keys`,
         `cached ${data.cache_updated_at}`
       ]);
@@ -309,6 +377,16 @@ HTML_PAGE = """<!doctype html>
         option.textContent = `${item.type} (${item.count})`;
         if (item.type === current) option.selected = true;
         select.appendChild(option);
+      }
+      const workoutSelect = document.getElementById("workoutType");
+      const currentWorkout = workoutSelect.value;
+      workoutSelect.innerHTML = `<option value="">Choose a workout type…</option>`;
+      for (const item of data.workout_types) {
+        const option = document.createElement("option");
+        option.value = item.type;
+        option.textContent = `${item.type} (${item.count})`;
+        if (item.type === currentWorkout) option.selected = true;
+        workoutSelect.appendChild(option);
       }
     }
 
@@ -343,11 +421,46 @@ HTML_PAGE = """<!doctype html>
       ]);
     }
 
+    async function loadWorkouts() {
+      const type = document.getElementById("workoutType").value;
+      if (!type) {
+        document.getElementById("status").textContent = "Select a workout activity type first.";
+        return;
+      }
+
+      const params = new URLSearchParams();
+      params.set("type", type);
+      const startDate = document.getElementById("startDate").value;
+      const endDate = document.getElementById("endDate").value;
+      const source = document.getElementById("sourceFilter").value.trim();
+      const limit = document.getElementById("limit").value;
+      if (startDate) params.set("start", startDate);
+      if (endDate) params.set("end", endDate);
+      if (source) params.set("source", source);
+      if (limit) params.set("limit", limit);
+
+      document.getElementById("status").textContent = "Scanning workouts in export.xml…";
+      const data = await fetchJson(`/api/workouts?${params.toString()}`);
+      renderWorkoutRows(data.workouts);
+      document.getElementById("status").textContent =
+        `Showing ${data.workouts.length} of ${data.matched_count} matching workouts.`;
+      buildSummary([
+        data.workout_type,
+        `${data.workouts.length} shown`,
+        `${data.matched_count} matched`,
+        `limit ${data.limit}`
+      ]);
+    }
+
     document.getElementById("loadButton").addEventListener("click", () => {
-      loadRecords().catch(error => {
+      const mode = document.getElementById("mode").value;
+      const action = mode === "records" ? loadRecords : loadWorkouts;
+      action().catch(error => {
         document.getElementById("status").textContent = error.message;
       });
     });
+
+    document.getElementById("mode").addEventListener("change", syncModeUi);
 
     document.getElementById("refreshCacheButton").addEventListener("click", () => {
       refreshCache().catch(error => {
@@ -392,6 +505,21 @@ def load_record_type_summary() -> list[dict[str, object]]:
     ]
 
 
+def load_workout_type_summary() -> list[dict[str, object]]:
+    counts: dict[str, int] = {}
+    for _, elem in ET.iterparse(EXPORT_XML_PATH, events=("end",)):
+        if elem.tag == "Workout":
+            workout_type = elem.attrib.get("workoutActivityType")
+            if workout_type:
+                counts[workout_type] = counts.get(workout_type, 0) + 1
+        elem.clear()
+
+    return [
+        {"type": workout_type, "count": count}
+        for workout_type, count in sorted(counts.items())
+    ]
+
+
 def count_metadata_keys() -> int:
     keys: set[str] = set()
     for _, elem in ET.iterparse(EXPORT_XML_PATH, events=("end",)):
@@ -406,6 +534,7 @@ def count_metadata_keys() -> int:
 def build_catalog_payload() -> dict[str, object]:
     payload = {
         "record_types": load_record_type_summary(),
+        "workout_types": load_workout_type_summary(),
         "metadata_key_count": count_metadata_keys(),
         "cache_updated_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
     }
@@ -435,7 +564,6 @@ def query_records(
 
     for _, elem in ET.iterparse(EXPORT_XML_PATH, events=("end",)):
         if elem.tag != "Record" or elem.attrib.get("type") != record_type:
-            elem.clear()
             continue
 
         record_start = parse_export_datetime(elem.attrib.get("startDate"))
@@ -477,6 +605,63 @@ def query_records(
     return records, matched_count
 
 
+def query_workouts(
+    workout_type: str,
+    start: datetime | None,
+    end: datetime | None,
+    source_contains: str | None,
+    limit: int,
+) -> tuple[list[dict[str, object]], int]:
+    workouts: list[dict[str, object]] = []
+    matched_count = 0
+    source_filter = source_contains.lower() if source_contains else None
+
+    for _, elem in ET.iterparse(EXPORT_XML_PATH, events=("end",)):
+        if elem.tag != "Workout" or elem.attrib.get("workoutActivityType") != workout_type:
+            continue
+
+        workout_start = parse_export_datetime(elem.attrib.get("startDate"))
+        workout_end = parse_export_datetime(elem.attrib.get("endDate"))
+        if start and workout_end and workout_end < start:
+            elem.clear()
+            continue
+        if end and workout_start and workout_start > end:
+            elem.clear()
+            continue
+        if source_filter:
+            source_name = elem.attrib.get("sourceName", "").replace("\xa0", " ")
+            if source_filter not in source_name.lower():
+                elem.clear()
+                continue
+
+        matched_count += 1
+        if len(workouts) < limit:
+            workouts.append(
+                {
+                    "workoutActivityType": elem.attrib.get("workoutActivityType", ""),
+                    "duration": elem.attrib.get("duration", ""),
+                    "durationUnit": elem.attrib.get("durationUnit", ""),
+                    "sourceName": elem.attrib.get("sourceName", "").replace("\xa0", " "),
+                    "sourceVersion": elem.attrib.get("sourceVersion", ""),
+                    "device": elem.attrib.get("device", ""),
+                    "creationDate": elem.attrib.get("creationDate", ""),
+                    "startDate": elem.attrib.get("startDate", ""),
+                    "endDate": elem.attrib.get("endDate", ""),
+                    "metadata": [
+                        {
+                            "key": child.attrib.get("key", ""),
+                            "value": child.attrib.get("value", ""),
+                        }
+                        for child in elem
+                        if child.tag == "MetadataEntry"
+                    ],
+                }
+            )
+        elem.clear()
+
+    return workouts, matched_count
+
+
 class ExplorerHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -515,6 +700,39 @@ class ExplorerHandler(BaseHTTPRequestHandler):
                 {
                     "record_type": record_type,
                     "records": records,
+                    "matched_count": matched_count,
+                    "limit": max(1, limit),
+                }
+            )
+            return
+
+        if parsed.path == "/api/workouts":
+            query = parse_qs(parsed.query)
+            workout_type = query.get("type", [""])[0]
+            if not workout_type:
+                self.respond_json({"error": "type is required"}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            try:
+                start = parse_ui_datetime(query.get("start", [""])[0] or None)
+                end = parse_ui_datetime(query.get("end", [""])[0] or None)
+                limit = min(int(query.get("limit", [str(100)])[0]), MAX_RESULTS)
+            except ValueError as exc:
+                self.respond_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            source_contains = query.get("source", [""])[0] or None
+            workouts, matched_count = query_workouts(
+                workout_type=workout_type,
+                start=start,
+                end=end,
+                source_contains=source_contains,
+                limit=max(1, limit),
+            )
+            self.respond_json(
+                {
+                    "workout_type": workout_type,
+                    "workouts": workouts,
                     "matched_count": matched_count,
                     "limit": max(1, limit),
                 }

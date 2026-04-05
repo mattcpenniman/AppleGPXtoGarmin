@@ -15,8 +15,11 @@ http://127.0.0.1:8765
 Features:
 
 - browse all `Record` types found in `apple_health_export/export.xml`
+- browse all `Workout` activity types found in `apple_health_export/export.xml`
 - filter records by start date, end date, source name, and limit
+- filter workouts by activity type, start date, end date, source name, and limit
 - inspect raw record metadata attached to each row
+- inspect raw workout attributes and attached metadata
 - cached record-type catalog for faster reloads
 - `Update cache` button to rebuild the dropdown catalog from `export.xml`
 
