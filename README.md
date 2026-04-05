@@ -23,6 +23,8 @@ Edit `.env` if you want different input or output paths:
 - `OUTPUT_DIR`
 - `GARMIN_CREATOR`
 - `OUTPUT_PREFIX`
+- `MODE` (`gpx` or `tcx`)
+- `LIMIT` (optional, for example `1`)
 - `OVERWRITE_EXISTING`
 
 ## Run In An IDE

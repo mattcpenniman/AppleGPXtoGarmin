@@ -26,6 +26,8 @@ class Config:
     output_dir: Path
     garmin_creator: str
     output_prefix: str
+    mode: str
+    limit: int | None
     overwrite_existing: bool
 
 
@@ -76,6 +78,8 @@ def load_config(project_root: Path) -> Config:
         output_dir=output_dir,
         garmin_creator=env_values.get("GARMIN_CREATOR", "Garmin Connect"),
         output_prefix=env_values.get("OUTPUT_PREFIX", "activity"),
+        mode=parse_mode(env_values.get("MODE", "gpx")),
+        limit=parse_optional_int(env_values.get("LIMIT")),
         overwrite_existing=parse_bool(env_values.get("OVERWRITE_EXISTING", "true")),
     )
 
@@ -104,6 +108,27 @@ def parse_env_file(env_path: Path) -> dict[str, str]:
 
 def parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_mode(value: str) -> str:
+    mode = value.strip().lower()
+    if mode not in {"gpx", "tcx"}:
+        raise ValueError("MODE must be either 'gpx' or 'tcx'")
+    return mode
+
+
+def parse_optional_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+
+    stripped = value.strip()
+    if not stripped:
+        return None
+
+    limit = int(stripped)
+    if limit <= 0:
+        raise ValueError("LIMIT must be a positive integer when provided")
+    return limit
 
 
 def resolve_path(project_root: Path, raw_path: str) -> Path:
@@ -178,7 +203,11 @@ def convert_routes(config: Config, route_map: dict[str, WorkoutInfo]) -> dict[st
 
     summary = {"written": 0, "skipped_existing": 0, "missing_routes": 0}
 
-    for route_key, workout in sorted(route_map.items()):
+    items = sorted(route_map.items())
+    if config.limit is not None:
+        items = items[: config.limit]
+
+    for route_key, workout in items:
         route_file = config.apple_export_dir / route_key
         if not route_file.exists():
             route_file = config.workout_routes_dir / Path(route_key).name
@@ -188,29 +217,44 @@ def convert_routes(config: Config, route_map: dict[str, WorkoutInfo]) -> dict[st
             summary["missing_routes"] += 1
             continue
 
-        output_path = config.output_dir / build_output_filename(config.output_prefix, workout)
+        output_path = config.output_dir / build_output_filename(
+            config.output_prefix,
+            workout,
+            config.mode,
+        )
         if output_path.exists() and not config.overwrite_existing:
             summary["skipped_existing"] += 1
             continue
 
-        garmin_tree = build_garmin_tree(
-            apple_route_path=route_file,
-            workout=workout,
-            garmin_creator=config.garmin_creator,
-        )
-        indent_xml(garmin_tree)
-        garmin_tree.write(output_path, encoding="utf-8", xml_declaration=True)
+        if config.mode == "gpx":
+            output_tree = build_garmin_gpx_tree(
+                apple_route_path=route_file,
+                workout=workout,
+                garmin_creator=config.garmin_creator,
+            )
+        else:
+            output_tree = build_garmin_tcx_tree(
+                apple_route_path=route_file,
+                workout=workout,
+            )
+
+        indent_xml(output_tree)
+        output_tree.write(output_path, encoding="utf-8", xml_declaration=True)
         summary["written"] += 1
 
     return summary
 
 
-def build_output_filename(output_prefix: str, workout: WorkoutInfo) -> str:
+def build_output_filename(output_prefix: str, workout: WorkoutInfo, mode: str) -> str:
     timestamp = workout.start_date.strftime("%Y%m%d_%H%M%S")
-    return f"{output_prefix}_{timestamp}.gpx"
+    return f"{output_prefix}_{timestamp}.{mode}"
 
 
-def build_garmin_tree(apple_route_path: Path, workout: WorkoutInfo, garmin_creator: str) -> ET.ElementTree:
+def build_garmin_gpx_tree(
+    apple_route_path: Path,
+    workout: WorkoutInfo,
+    garmin_creator: str,
+) -> ET.ElementTree:
     apple_tree = ET.parse(apple_route_path)
     apple_root = apple_tree.getroot()
 
@@ -262,6 +306,59 @@ def build_garmin_tree(apple_route_path: Path, workout: WorkoutInfo, garmin_creat
     return ET.ElementTree(garmin_root)
 
 
+def build_garmin_tcx_tree(apple_route_path: Path, workout: WorkoutInfo) -> ET.ElementTree:
+    apple_tree = ET.parse(apple_route_path)
+    apple_root = apple_tree.getroot()
+    apple_trkpts = apple_root.findall(f".//{{{APPLE_GPX_NS}}}trkpt")
+    if not apple_trkpts:
+        raise ValueError(f"No track points found in {apple_route_path}")
+
+    tcx_ns = "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"
+    xsi_schema = (
+        "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2 "
+        "http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd"
+    )
+
+    ET.register_namespace("", tcx_ns)
+
+    root = ET.Element(
+        f"{{{tcx_ns}}}TrainingCenterDatabase",
+        {f"{{{XSI_NS}}}schemaLocation": xsi_schema},
+    )
+    activities = ET.SubElement(root, f"{{{tcx_ns}}}Activities")
+    activity = ET.SubElement(activities, f"{{{tcx_ns}}}Activity", {"Sport": "Running"})
+    ET.SubElement(activity, f"{{{tcx_ns}}}Id").text = format_tcx_time(workout.start_date)
+
+    lap = ET.SubElement(
+        activity,
+        f"{{{tcx_ns}}}Lap",
+        {"StartTime": format_tcx_time(workout.start_date)},
+    )
+    ET.SubElement(lap, f"{{{tcx_ns}}}TotalTimeSeconds").text = format_seconds(workout)
+    ET.SubElement(lap, f"{{{tcx_ns}}}DistanceMeters").text = format_distance_meters(workout)
+    ET.SubElement(lap, f"{{{tcx_ns}}}Calories").text = "0"
+    ET.SubElement(lap, f"{{{tcx_ns}}}Intensity").text = "Active"
+    ET.SubElement(lap, f"{{{tcx_ns}}}TriggerMethod").text = "Manual"
+
+    track = ET.SubElement(lap, f"{{{tcx_ns}}}Track")
+    for apple_trkpt in apple_trkpts:
+        trackpoint = ET.SubElement(track, f"{{{tcx_ns}}}Trackpoint")
+        apple_time = apple_trkpt.find(f"{{{APPLE_GPX_NS}}}time")
+        apple_ele = apple_trkpt.find(f"{{{APPLE_GPX_NS}}}ele")
+
+        if apple_time is not None and apple_time.text:
+            ET.SubElement(trackpoint, f"{{{tcx_ns}}}Time").text = normalize_utc_text(apple_time.text)
+
+        position = ET.SubElement(trackpoint, f"{{{tcx_ns}}}Position")
+        ET.SubElement(position, f"{{{tcx_ns}}}LatitudeDegrees").text = apple_trkpt.attrib["lat"]
+        ET.SubElement(position, f"{{{tcx_ns}}}LongitudeDegrees").text = apple_trkpt.attrib["lon"]
+
+        if apple_ele is not None and apple_ele.text:
+            ET.SubElement(trackpoint, f"{{{tcx_ns}}}AltitudeMeters").text = apple_ele.text
+
+    return ET.ElementTree(root)
+
+
 def build_track_name(workout: WorkoutInfo) -> str:
     local_time = workout.start_date.strftime("%Y-%m-%d %I:%M %p").lstrip("0")
     details: list[str] = []
@@ -292,6 +389,36 @@ def normalize_utc_text(value: str) -> str:
 def format_garmin_time(value: datetime) -> str:
     utc_value = value.astimezone(timezone.utc)
     return utc_value.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def format_tcx_time(value: datetime) -> str:
+    utc_value = value.astimezone(timezone.utc)
+    return utc_value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def format_seconds(workout: WorkoutInfo) -> str:
+    if workout.duration_minutes is None:
+        seconds = max((workout.end_date - workout.start_date).total_seconds(), 0)
+    else:
+        seconds = float(workout.duration_minutes) * 60
+    return f"{seconds:.3f}"
+
+
+def format_distance_meters(workout: WorkoutInfo) -> str:
+    if not workout.distance or not workout.distance_unit:
+        return "0"
+
+    distance = float(workout.distance)
+    unit = workout.distance_unit.lower()
+    if unit == "mi":
+        meters = distance * 1609.344
+    elif unit == "km":
+        meters = distance * 1000
+    elif unit == "m":
+        meters = distance
+    else:
+        meters = distance
+    return f"{meters:.3f}"
 
 
 def indent_xml(tree: ET.ElementTree) -> None:
