@@ -37,13 +37,14 @@ class Config:
 
 @dataclass
 class WorkoutInfo:
-    route_relative_path: str
+    route_relative_path: str | None
     start_date: datetime
     end_date: datetime
     duration_minutes: str | None
     distance: str | None
     distance_unit: str | None
     source_name: str | None
+    is_indoor: bool
 
 
 @dataclass
@@ -190,9 +191,16 @@ def load_running_workout_routes(export_xml_path: Path) -> dict[str, WorkoutInfo]
             continue
 
         route_relative_path: str | None = None
+        is_indoor = False
         distance = elem.attrib.get("totalDistance")
         distance_unit = elem.attrib.get("totalDistanceUnit")
         for child in elem:
+            if (
+                child.tag == "MetadataEntry"
+                and child.attrib.get("key") == "HKIndoorWorkout"
+                and child.attrib.get("value") == "1"
+            ):
+                is_indoor = True
             if child.tag == "WorkoutStatistics":
                 stat_type = child.attrib.get("type")
                 if (
@@ -210,15 +218,18 @@ def load_running_workout_routes(export_xml_path: Path) -> dict[str, WorkoutInfo]
             if route_relative_path:
                 break
 
-        if route_relative_path:
-            route_map[normalize_route_path(route_relative_path)] = WorkoutInfo(
-                route_relative_path=normalize_route_path(route_relative_path),
+        workout_key = normalize_route_path(route_relative_path) if route_relative_path else build_workout_key(elem.attrib["startDate"])
+
+        if route_relative_path or is_indoor:
+            route_map[workout_key] = WorkoutInfo(
+                route_relative_path=normalize_route_path(route_relative_path) if route_relative_path else None,
                 start_date=parse_apple_datetime(elem.attrib["startDate"]),
                 end_date=parse_apple_datetime(elem.attrib["endDate"]),
                 duration_minutes=elem.attrib.get("duration"),
                 distance=distance,
                 distance_unit=distance_unit,
                 source_name=elem.attrib.get("sourceName"),
+                is_indoor=is_indoor,
             )
 
         elem.clear()
@@ -229,6 +240,10 @@ def load_running_workout_routes(export_xml_path: Path) -> dict[str, WorkoutInfo]
 def normalize_route_path(route_path: str) -> str:
     cleaned = route_path.replace("\\", "/").strip()
     return cleaned.lstrip("/")
+
+
+def build_workout_key(start_date: str) -> str:
+    return f"__workout__/{start_date}"
 
 
 def parse_apple_datetime(value: str) -> datetime:
@@ -252,13 +267,19 @@ def convert_routes(config: Config, route_map: dict[str, WorkoutInfo]) -> dict[st
     export_catalogs = load_export_catalogs(config.export_xml_path) if config.debug_xlsx else None
 
     for route_key, workout in items:
-        route_file = config.apple_export_dir / route_key
-        if not route_file.exists():
-            route_file = config.workout_routes_dir / Path(route_key).name
+        route_file: Path | None = None
+        if workout.route_relative_path:
+            route_file = config.apple_export_dir / workout.route_relative_path
+            if not route_file.exists():
+                route_file = config.workout_routes_dir / Path(workout.route_relative_path).name
 
-        if not route_file.exists():
-            print(f"Missing route file for running workout: {route_key}")
-            summary["missing_routes"] += 1
+            if not route_file.exists():
+                print(f"Missing route file for running workout: {route_key}")
+                summary["missing_routes"] += 1
+                continue
+
+        if config.mode == "gpx" and route_file is None:
+            print(f"Skipping workout without route in GPX mode: {workout.start_date}")
             continue
 
         output_path = config.output_dir / build_output_filename(
@@ -308,12 +329,14 @@ def build_output_filename(output_prefix: str, workout: WorkoutInfo, mode: str) -
 
 
 def build_garmin_gpx_tree(
-    apple_route_path: Path,
+    apple_route_path: Path | None,
     workout: WorkoutInfo,
     metrics: WorkoutMetrics,
     fuzzy_match_seconds: int,
     garmin_creator: str,
 ) -> ET.ElementTree:
+    if apple_route_path is None:
+        raise ValueError("GPX export requires a route file")
     apple_tree = ET.parse(apple_route_path)
     apple_root = apple_tree.getroot()
 
@@ -388,16 +411,16 @@ def build_garmin_gpx_tree(
 
 
 def build_garmin_tcx_tree(
-    apple_route_path: Path,
+    apple_route_path: Path | None,
     workout: WorkoutInfo,
     metrics: WorkoutMetrics,
     fuzzy_match_seconds: int,
 ) -> ET.ElementTree:
-    apple_tree = ET.parse(apple_route_path)
-    apple_root = apple_tree.getroot()
-    apple_trkpts = apple_root.findall(f".//{{{APPLE_GPX_NS}}}trkpt")
-    if not apple_trkpts:
-        raise ValueError(f"No track points found in {apple_route_path}")
+    apple_trkpts: list[ET.Element] = []
+    if apple_route_path is not None:
+        apple_tree = ET.parse(apple_route_path)
+        apple_root = apple_tree.getroot()
+        apple_trkpts = apple_root.findall(f".//{{{APPLE_GPX_NS}}}trkpt")
 
     tcx_ns = "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"
     xsi_schema = (
@@ -426,41 +449,42 @@ def build_garmin_tcx_tree(
     ET.SubElement(lap, f"{{{tcx_ns}}}Intensity").text = "Active"
     ET.SubElement(lap, f"{{{tcx_ns}}}TriggerMethod").text = "Manual"
 
-    track = ET.SubElement(lap, f"{{{tcx_ns}}}Track")
-    hr_cursor = 0
-    cad_cursor = 0
-    for apple_trkpt in apple_trkpts:
-        trackpoint = ET.SubElement(track, f"{{{tcx_ns}}}Trackpoint")
-        apple_time = apple_trkpt.find(f"{{{APPLE_GPX_NS}}}time")
-        apple_ele = apple_trkpt.find(f"{{{APPLE_GPX_NS}}}ele")
+    if apple_trkpts:
+        track = ET.SubElement(lap, f"{{{tcx_ns}}}Track")
+        hr_cursor = 0
+        cad_cursor = 0
+        for apple_trkpt in apple_trkpts:
+            trackpoint = ET.SubElement(track, f"{{{tcx_ns}}}Trackpoint")
+            apple_time = apple_trkpt.find(f"{{{APPLE_GPX_NS}}}time")
+            apple_ele = apple_trkpt.find(f"{{{APPLE_GPX_NS}}}ele")
 
-        if apple_time is not None and apple_time.text:
-            point_time = datetime.fromisoformat(apple_time.text.replace("Z", "+00:00"))
-            ET.SubElement(trackpoint, f"{{{tcx_ns}}}Time").text = normalize_utc_text(apple_time.text)
-            heart_rate, hr_cursor = sample_value_for_time(
-                metrics.heart_rate,
-                point_time,
-                hr_cursor,
-                fuzzy_match_seconds,
-            )
-            cadence, cad_cursor = sample_value_for_time(
-                metrics.cadence,
-                point_time,
-                cad_cursor,
-                fuzzy_match_seconds,
-            )
-            if heart_rate is not None:
-                heart_rate_bpm = ET.SubElement(trackpoint, f"{{{tcx_ns}}}HeartRateBpm")
-                ET.SubElement(heart_rate_bpm, f"{{{tcx_ns}}}Value").text = str(heart_rate)
-            if cadence is not None:
-                ET.SubElement(trackpoint, f"{{{tcx_ns}}}Cadence").text = str(cadence)
+            if apple_time is not None and apple_time.text:
+                point_time = datetime.fromisoformat(apple_time.text.replace("Z", "+00:00"))
+                ET.SubElement(trackpoint, f"{{{tcx_ns}}}Time").text = normalize_utc_text(apple_time.text)
+                heart_rate, hr_cursor = sample_value_for_time(
+                    metrics.heart_rate,
+                    point_time,
+                    hr_cursor,
+                    fuzzy_match_seconds,
+                )
+                cadence, cad_cursor = sample_value_for_time(
+                    metrics.cadence,
+                    point_time,
+                    cad_cursor,
+                    fuzzy_match_seconds,
+                )
+                if heart_rate is not None:
+                    heart_rate_bpm = ET.SubElement(trackpoint, f"{{{tcx_ns}}}HeartRateBpm")
+                    ET.SubElement(heart_rate_bpm, f"{{{tcx_ns}}}Value").text = str(heart_rate)
+                if cadence is not None:
+                    ET.SubElement(trackpoint, f"{{{tcx_ns}}}Cadence").text = str(cadence)
 
-        position = ET.SubElement(trackpoint, f"{{{tcx_ns}}}Position")
-        ET.SubElement(position, f"{{{tcx_ns}}}LatitudeDegrees").text = apple_trkpt.attrib["lat"]
-        ET.SubElement(position, f"{{{tcx_ns}}}LongitudeDegrees").text = apple_trkpt.attrib["lon"]
+            position = ET.SubElement(trackpoint, f"{{{tcx_ns}}}Position")
+            ET.SubElement(position, f"{{{tcx_ns}}}LatitudeDegrees").text = apple_trkpt.attrib["lat"]
+            ET.SubElement(position, f"{{{tcx_ns}}}LongitudeDegrees").text = apple_trkpt.attrib["lon"]
 
-        if apple_ele is not None and apple_ele.text:
-            ET.SubElement(trackpoint, f"{{{tcx_ns}}}AltitudeMeters").text = apple_ele.text
+            if apple_ele is not None and apple_ele.text:
+                ET.SubElement(trackpoint, f"{{{tcx_ns}}}AltitudeMeters").text = apple_ele.text
 
     return ET.ElementTree(root)
 
@@ -696,7 +720,7 @@ def format_distance_meters(workout: WorkoutInfo) -> str:
 def write_debug_workbook(
     output_path: Path,
     export_catalogs: tuple[list[list[str]], list[list[str]]] | None,
-    apple_route_path: Path,
+    apple_route_path: Path | None,
     workout: WorkoutInfo,
     metrics: WorkoutMetrics,
     fuzzy_match_seconds: int,
@@ -722,10 +746,12 @@ def write_debug_workbook(
 
 
 def build_debug_points_rows(
-    apple_route_path: Path,
+    apple_route_path: Path | None,
     metrics: WorkoutMetrics,
     fuzzy_match_seconds: int,
 ) -> list[list[str]]:
+    if apple_route_path is None:
+        return [["point_time", "lat", "lon", "ele", "matched_hr", "matched_cadence"]]
     apple_tree = ET.parse(apple_route_path)
     apple_root = apple_tree.getroot()
     apple_trkpts = apple_root.findall(f".//{{{APPLE_GPX_NS}}}trkpt")
