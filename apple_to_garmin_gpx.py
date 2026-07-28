@@ -74,8 +74,8 @@ def main() -> None:
     print(f"Output folder: {config.output_dir}")
 
 
-def load_config(project_root: Path) -> Config:
-    env_path = project_root / ".env"
+def load_config(project_root: Path, env_path: Path | None = None) -> Config:
+    env_path = env_path or project_root / ".env"
     env_values = parse_env_file(env_path)
 
     apple_export_dir = resolve_path(
@@ -110,7 +110,7 @@ def load_config(project_root: Path) -> Config:
 
 def parse_env_file(env_path: Path) -> dict[str, str]:
     if not env_path.exists():
-        raise FileNotFoundError(f"Missing .env file: {env_path}")
+        return {}
 
     values: dict[str, str] = {}
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():

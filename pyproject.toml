@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apple-garmin"
+version = "0.1.0"
+description = "Convert Apple Health activities and export Garmin Connect activities"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "garminconnect>=0.3.7,<0.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+apple-garmin = "apple_garmin.cli:main"
+
+[tool.setuptools]
+packages = ["apple_garmin"]
+py-modules = ["apple_to_garmin_gpx", "apple_health_explorer", "garmin_batch_import"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

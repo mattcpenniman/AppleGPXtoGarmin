@@ -2,7 +2,13 @@ apple_health_export/
 Archive/
 Garmin Example/
 garmin_gpx_output/
+garmin_exports/
+.garminconnect/
 .env
 .DS_Store
 *.pyc
 *.json
+*.egg-info/
+.pytest_cache/
+build/
+dist/
